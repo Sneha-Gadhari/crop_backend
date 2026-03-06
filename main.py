@@ -1,10 +1,32 @@
+"""
+Smart Crop DSS — FastAPI Backend  v5.0
+Maharashtra-focused.
+
+What's new in v5:
+  • /recommend-crops returns top_n crops (default 5, max 10), re-ranked by
+    composite_score = AI_confidence×0.40 + (100−risk)×0.35 + budget_fit×0.25
+  • Each crop now includes:
+      affordability   — can_afford, input_cost, budget_remaining, label
+      harvest_days    — ICAR sowing→harvest calendar
+      mandi_prices    — Agmarknet variety-wise min/modal/max + arrival date
+  • Agmarknet fetch uses variety-wise resource (fields: State/District/Market/
+    Commodity/Variety/Min_Price/Max_Price/Modal_Price/Arrival_Date)
+  • GET /mandi-prices/{district}/{crop} — standalone mandi price endpoint
+
+Set in .env:
+  OPENWEATHER_API_KEY = <key>
+  HF_API_TOKEN        = <optional>
+  DATA_GOV_API_KEY    = <key from https://data.gov.in>
+"""
+
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional
 from contextlib import asynccontextmanager
-import sqlite3, os
+import sqlite3, os, httpx, asyncio
 from dotenv import load_dotenv
+from datetime import datetime, timedelta
 
 load_dotenv()
 
@@ -12,7 +34,7 @@ from services.weather_service   import WeatherService
 from services.soil_classifier   import SoilClassifier
 from services.crop_recommender  import CropRecommender
 from services.disease_detector  import DiseaseDetector
-from services.risk_engine       import RiskEngine
+from services.risk_engine       import RiskEngine, CROP_PROFILES, INPUT_COSTS, DEFAULT_INPUT_COST, MARKET_DATA
 from services.pest_engine       import PestEngine
 
 # ── Globals ───────────────────────────────────────────────────────────
@@ -23,19 +45,171 @@ disease_det : DiseaseDetector = None
 risk_eng    : RiskEngine      = None
 pest_eng    : PestEngine      = None
 
+DB_PATH          = "sightings.db"
+DATA_GOV_API_KEY = os.getenv("DATA_GOV_API_KEY", "")
+
+# ── In-process cache ─────────────────────────────────────────────────
+_price_cache: dict = {}   # key → {data, fetched_at}
+_msp_cache  : dict = {}   # crop_key → msp price
+_yield_cache: dict = {}   # (district, crop) → yield dict
+_CACHE_TTL = 3600         # 1 hour
+
+# ── Harvest days (sowing → harvest, days) ICAR/PKV/MPKV Maharashtra ──
+HARVEST_DAYS: dict[str, int] = {
+    "rice": 120,       "wheat": 120,        "cotton": 180,
+    "soybean": 100,    "soyabean": 100,     "maize": 100,
+    "sugarcane": 365,  "groundnut": 130,    "banana": 300,
+    "mango": 120,      "coconut": 365,      "pomegranate": 180,
+    "grapes": 240,     "onion": 120,        "tomato": 80,
+    "chickpea": 110,   "gram": 110,         "pigeonpeas": 180,
+    "arhar/tur": 180,  "lentil": 110,       "orange": 300,
+    "coffee": 365,     "jute": 120,         "mungbean": 65,
+    "blackgram": 75,   "urad": 75,          "watermelon": 90,
+    "muskmelon": 85,   "papaya": 240,       "mothbeans": 90,
+    "kidneybeans": 90, "apple": 150,        "bajra": 80,
+    "jowar": 110,      "ragi": 120,         "sunflower": 100,
+    "sesamum": 80,     "safflower": 130,    "linseed": 120,
+}
+
+# ── Nearest Maharashtra APMC mandis per district ─────────────────────
+DISTRICT_MANDI: dict[str, list[str]] = {
+    "Nagpur"                   : ["Nagpur", "Wardha"],
+    "Wardha"                   : ["Wardha", "Nagpur"],
+    "Amravati"                 : ["Amravati", "Akola"],
+    "Akola"                    : ["Akola", "Washim"],
+    "Washim"                   : ["Washim", "Akola"],
+    "Buldhana"                 : ["Buldhana", "Akola"],
+    "Yavatmal"                 : ["Yavatmal", "Wardha"],
+    "Chandrapur"               : ["Chandrapur", "Nagpur"],
+    "Gadchiroli"               : ["Gadchiroli", "Chandrapur"],
+    "Gondia"                   : ["Gondia", "Bhandara"],
+    "Bhandara"                 : ["Bhandara", "Nagpur"],
+    "Chhatrapati Sambhajinagar": ["Aurangabad", "Jalna"],
+    "Dharashiv"                : ["Osmanabad", "Latur"],
+    "Beed"                     : ["Beed", "Aurangabad"],
+    "Hingoli"                  : ["Hingoli", "Nanded"],
+    "Jalna"                    : ["Jalna", "Aurangabad"],
+    "Latur"                    : ["Latur", "Osmanabad"],
+    "Nanded"                   : ["Nanded", "Latur"],
+    "Parbhani"                 : ["Parbhani", "Hingoli"],
+    "Pune"                     : ["Pune", "Satara"],
+    "Nashik"                   : ["Nashik", "Yeola"],
+    "Ahilyanagar"              : ["Ahmednagar", "Kopargaon"],
+    "Solapur"                  : ["Solapur", "Pandharpur"],
+    "Satara"                   : ["Satara", "Karad"],
+    "Sangli"                   : ["Sangli", "Miraj"],
+    "Kolhapur"                 : ["Kolhapur", "Ichalkaranji"],
+    "Raigad"                   : ["Alibag", "Panvel"],
+    "Ratnagiri"                : ["Ratnagiri", "Chiplun"],
+    "Sindhudurg"               : ["Sindhudurg", "Sawantwadi"],
+    "Thane"                    : ["Thane", "Kalyan"],
+    "Palghar"                  : ["Palghar", "Vasai"],
+    "Mumbai suburban"          : ["Mumbai", "Vashi"],
+    "Dhule"                    : ["Dhule", "Shirpur"],
+    "Nandurbar"                : ["Nandurbar", "Shahada"],
+    "Jalgaon"                  : ["Jalgaon", "Bhusawal"],
+}
+
+# ── Agmarknet commodity name map ──────────────────────────────────────
+_COMMODITY_MAP: dict[str, str] = {
+    "rice": "Rice",             "wheat": "Wheat",
+    "cotton": "Cotton(Lint)",   "soybean": "Soybean",
+    "soyabean": "Soybean",      "maize": "Maize",
+    "sugarcane": "Sugarcane",   "groundnut": "Groundnut",
+    "banana": "Banana",         "mango": "Mango",
+    "coconut": "Coconut",       "pomegranate": "Pomegranate",
+    "grapes": "Grapes",         "onion": "Onion",
+    "tomato": "Tomato",         "chickpea": "Gram",
+    "gram": "Gram",             "pigeonpeas": "Arhar(Tur/Red Gram)(Whole)",
+    "arhar/tur": "Arhar(Tur/Red Gram)(Whole)",
+    "lentil": "Lentil (Masur)(Whole)",
+    "orange": "Orange",         "mungbean": "Moong(Green Gram)(Whole)",
+    "blackgram": "Black Gram (Urd Beans)(Whole)",
+    "urad": "Black Gram (Urd Beans)(Whole)",
+    "watermelon": "Water Melon","muskmelon": "Musk Melon",
+    "papaya": "Papaya",         "bajra": "Bajra(Pearl Millet/Cumbu)",
+    "jowar": "Jowar(Sorghum)",  "sunflower": "Sunflower Seed",
+    "ragi": "Ragi (Finger Millet/Nagli/Ragi)",
+}
+
+# ── Static fallback APMC prices ₹/quintal (AGMARKNET 2023-24 averages) ──
+MARKET_PRICES_FALLBACK: dict[str, float] = {
+    "rice": 2183,        "wheat": 2275,       "cotton": 6680,
+    "soybean": 4600,     "soyabean": 4600,    "maize": 2090,
+    "sugarcane": 3150,   "groundnut": 5550,   "banana": 1400,
+    "mango": 3200,       "coconut": 2800,     "pomegranate": 8000,
+    "grapes": 5500,      "onion": 1800,       "tomato": 2500,
+    "chickpea": 5440,    "gram": 5440,        "pigeonpeas": 7000,
+    "arhar/tur": 7000,   "lentil": 6425,      "orange": 3500,
+    "coffee": 9000,      "jute": 4750,        "mungbean": 8558,
+    "blackgram": 7400,   "urad": 7400,        "watermelon": 800,
+    "muskmelon": 1200,   "papaya": 1500,      "mothbeans": 8558,
+    "kidneybeans": 6000, "apple": 12000,      "bajra": 2500,
+    "jowar": 2800,       "sunflower": 7280,   "ragi": 3000,
+    "sesamum": 7830,     "safflower": 5800,
+}
+
+# CACP 2024-25 MSP fallback (₹/quintal)
+MSP_FALLBACK: dict[str, float] = {
+    "rice": 2300,     "wheat": 2275,     "cotton": 7121,
+    "soybean": 4892,  "soyabean": 4892,  "maize": 2225,
+    "groundnut": 6783,"chickpea": 5440,  "gram": 5440,
+    "pigeonpeas": 7000,"lentil": 6425,   "mungbean": 8682,
+    "blackgram": 7400, "urad": 7400,     "sugarcane": 3400,
+    "jute": 5335,     "sunflower": 7280, "bajra": 2625,
+    "jowar": 3371,    "ragi": 4290,      "sesamum": 9267,
+    "safflower": 5800,
+}
+
+IRRIGATION_YIELD_FACTOR = {"Full": 1.20, "Partial": 1.0, "None": 0.80}
+
+YIELD_BENCHMARKS: dict[str, dict] = {
+    "rice": dict(low=900, high=1600),     "wheat": dict(low=1000, high=1800),
+    "cotton": dict(low=200, high=500),    "soybean": dict(low=600, high=1100),
+    "soyabean": dict(low=600, high=1100), "maize": dict(low=900, high=1700),
+    "sugarcane": dict(low=20000, high=40000),
+    "groundnut": dict(low=500, high=900), "banana": dict(low=7000, high=15000),
+    "mango": dict(low=2000, high=6000),   "coconut": dict(low=3000, high=8000),
+    "pomegranate": dict(low=3000, high=8000),
+    "grapes": dict(low=4000, high=10000), "onion": dict(low=5000, high=12000),
+    "tomato": dict(low=6000, high=15000), "chickpea": dict(low=350, high=700),
+    "gram": dict(low=350, high=700),      "pigeonpeas": dict(low=400, high=800),
+    "arhar/tur": dict(low=400, high=800), "lentil": dict(low=300, high=600),
+    "orange": dict(low=2500, high=6000),  "coffee": dict(low=300, high=700),
+    "jute": dict(low=1500, high=2800),    "mungbean": dict(low=200, high=450),
+    "blackgram": dict(low=200, high=450), "urad": dict(low=200, high=450),
+    "watermelon": dict(low=8000, high=18000),
+    "muskmelon": dict(low=4000, high=10000),
+    "papaya": dict(low=8000, high=20000), "bajra": dict(low=700, high=1400),
+    "jowar": dict(low=800, high=1500),    "sunflower": dict(low=400, high=800),
+    "ragi": dict(low=600, high=1200),
+}
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  DB + lifespan
+# ══════════════════════════════════════════════════════════════════════
+
 def _init_db():
-    conn = sqlite3.connect("sightings.db")
-    conn.execute("""CREATE TABLE IF NOT EXISTS sightings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        district TEXT, crop TEXT, pest TEXT,
-        severity TEXT, ts DATETIME DEFAULT CURRENT_TIMESTAMP
-    )""")
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sightings (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            district TEXT    NOT NULL,
+            crop     TEXT    NOT NULL,
+            pest     TEXT    NOT NULL,
+            severity TEXT    NOT NULL,
+            ts       DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     conn.commit(); conn.close()
+    print("✅ DB initialised")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global weather_svc, soil_clf, crop_rec, disease_det, risk_eng, pest_eng
-    print("🌱 Starting backend...")
+    print("🌱 Starting SmartCrop backend v5...")
     _init_db()
     weather_svc = WeatherService(os.getenv("OPENWEATHER_API_KEY", ""))
     soil_clf    = SoilClassifier()
@@ -43,88 +217,398 @@ async def lifespan(app: FastAPI):
     disease_det = DiseaseDetector(os.getenv("HF_API_TOKEN", ""))
     risk_eng    = RiskEngine()
     pest_eng    = PestEngine()
+    asyncio.create_task(_warm_msp_cache())
     print("✅ All services ready.")
     yield
 
-app = FastAPI(title="Smart Crop DSS", version="2.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware,
-    allow_origins=["*"],   # tighten in production
-    allow_methods=["*"], allow_headers=["*"])
 
-# ── Pydantic schemas ──────────────────────────────────────────────────
+app = FastAPI(title="Smart Crop DSS", version="5.0.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Agmarknet — variety-wise prices
+#  Resource: 9ef84268-d588-465a-a308-a864a43d0070
+#  Fields: State | District | Market | Commodity | Variety |
+#          Min_Price | Max_Price | Modal_Price | Arrival_Date
+# ══════════════════════════════════════════════════════════════════════
+
+_AGMARKNET_URL = "https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070"
+
+
+async def _fetch_mandi_prices(crop_key: str, district: str) -> Optional[dict]:
+    """
+    Fetches variety-wise min/modal/max prices from the nearest Maharashtra mandi.
+    Returns a structured dict or None if unavailable.
+    """
+    if not DATA_GOV_API_KEY:
+        return None
+
+    cache_key = f"mandi:{district.lower()}:{crop_key}"
+    cached = _price_cache.get(cache_key)
+    if cached and (datetime.now() - cached["_ts"]).seconds < _CACHE_TTL:
+        return {k: v for k, v in cached.items() if k != "_ts"}
+
+    commodity = _COMMODITY_MAP.get(crop_key)
+    if not commodity:
+        return None
+
+    mandis = DISTRICT_MANDI.get(district, ["Pune"])
+    all_records: list[dict] = []
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            # Try nearest mandis first
+            for mandi in mandis[:2]:
+                params = {
+                    "api-key"            : DATA_GOV_API_KEY,
+                    "format"             : "json",
+                    "limit"              : "10",
+                    "filters[State]"     : "Maharashtra",
+                    "filters[Commodity]" : commodity,
+                    "filters[Market]"    : mandi,
+                }
+                r = await client.get(_AGMARKNET_URL, params=params)
+                r.raise_for_status()
+                for rec in r.json().get("records", []):
+                    v = _parse_record(rec)
+                    if v:
+                        all_records.append(v)
+                if all_records:
+                    break
+
+            # State-wide fallback if no mandi-specific data
+            if not all_records:
+                params = {
+                    "api-key"            : DATA_GOV_API_KEY,
+                    "format"             : "json",
+                    "limit"              : "5",
+                    "filters[State]"     : "Maharashtra",
+                    "filters[Commodity]" : commodity,
+                }
+                r = await client.get(_AGMARKNET_URL, params=params)
+                r.raise_for_status()
+                for rec in r.json().get("records", []):
+                    v = _parse_record(rec)
+                    if v:
+                        all_records.append(v)
+
+    except Exception as e:
+        print(f"⚠️  Agmarknet error {district}/{crop_key}: {e}")
+        return None
+
+    if not all_records:
+        return None
+
+    # Best = most recent + highest modal price
+    best = sorted(all_records, key=lambda r: (r["arrival_date"], r["modal_price"]), reverse=True)[0]
+    result = {
+        "mandi_name"  : best["mandi"],
+        "commodity"   : commodity,
+        "variety"     : best["variety"],
+        "min_price"   : best["min_price"],
+        "modal_price" : best["modal_price"],
+        "max_price"   : best["max_price"],
+        "arrival_date": best["arrival_date"],
+        "all_mandis"  : all_records[:5],
+        "source"      : "agmarknet_live",
+        "_ts"         : datetime.now(),
+    }
+    _price_cache[cache_key] = result
+    return {k: v for k, v in result.items() if k != "_ts"}
+
+
+def _parse_record(rec: dict) -> Optional[dict]:
+    modal = _safe_float(rec.get("Modal_Price"))
+    if not modal or modal <= 0:
+        return None
+    return {
+        "mandi"       : rec.get("Market", "Maharashtra APMC"),
+        "variety"     : rec.get("Variety", "Common"),
+        "min_price"   : _safe_float(rec.get("Min_Price")) or modal * 0.75,
+        "modal_price" : modal,
+        "max_price"   : _safe_float(rec.get("Max_Price")) or modal * 1.25,
+        "arrival_date": rec.get("Arrival_Date", ""),
+    }
+
+
+def _safe_float(val) -> Optional[float]:
+    try:
+        return float(str(val).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+async def _fetch_agmarknet_modal(crop_key: str) -> Optional[float]:
+    """Simple modal price fetch used for revenue estimates."""
+    cache_key = f"modal:{crop_key}"
+    cached = _price_cache.get(cache_key)
+    if cached and (datetime.now() - cached["_ts"]).seconds < _CACHE_TTL:
+        return cached.get("price")
+    commodity = _COMMODITY_MAP.get(crop_key)
+    if not commodity or not DATA_GOV_API_KEY:
+        return None
+    try:
+        params = {
+            "api-key"            : DATA_GOV_API_KEY,
+            "format"             : "json",
+            "limit"              : "20",
+            "filters[State]"     : "Maharashtra",
+            "filters[Commodity]" : commodity,
+        }
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            r = await client.get(_AGMARKNET_URL, params=params)
+            r.raise_for_status()
+            prices = [_safe_float(rec.get("Modal_Price")) for rec in r.json().get("records", [])]
+            prices = [p for p in prices if p and p > 0]
+            if not prices:
+                return None
+            avg = sum(prices) / len(prices)
+            _price_cache[cache_key] = {"price": avg, "_ts": datetime.now()}
+            return avg
+    except Exception:
+        return None
+
+
+# ── MSP warm-up ───────────────────────────────────────────────────────
+_MSP_RESOURCE = "35be93cd-ab6f-4fdd-859a-e1d2f04b8571"
+_MSP_COMMODITY_MAP = {
+    "rice": "Paddy (Common)",   "wheat": "Wheat",
+    "cotton": "Cotton (Medium Staple)", "soybean": "Soybean (Yellow)",
+    "soyabean": "Soybean (Yellow)",     "maize": "Maize",
+    "groundnut": "Groundnut",  "chickpea": "Gram",  "gram": "Gram",
+    "pigeonpeas": "Arhar/Tur", "lentil": "Masur (Lentil)",
+    "mungbean": "Moong",       "blackgram": "Urad", "urad": "Urad",
+    "sugarcane": "Sugarcane (FRP)", "bajra": "Bajra",
+    "jowar": "Jowar (Hybrid)", "sunflower": "Sunflower Seed",
+}
+
+
+async def _warm_msp_cache():
+    if not DATA_GOV_API_KEY:
+        return
+    try:
+        url = f"https://api.data.gov.in/resource/{_MSP_RESOURCE}"
+        params = {"api-key": DATA_GOV_API_KEY, "format": "json", "limit": "100"}
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(url, params=params)
+        records = r.json().get("records", [])
+        live: dict[str, float] = {}
+        for rec in records:
+            name  = (rec.get("commodity") or rec.get("Commodity", "")).strip().lower()
+            price = rec.get("msp") or rec.get("MSP") or rec.get("Price", 0)
+            try:
+                live[name] = float(str(price).replace(",", ""))
+            except (ValueError, TypeError):
+                pass
+        for crop_key, api_name in _MSP_COMMODITY_MAP.items():
+            match = live.get(api_name.lower())
+            if match:
+                _msp_cache[crop_key] = match
+        print(f"✅ MSP cache: {len(_msp_cache)} crops loaded")
+    except Exception as e:
+        print(f"⚠️  MSP cache warm failed: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Pydantic schemas
+# ══════════════════════════════════════════════════════════════════════
 
 class CropRequest(BaseModel):
-    # These 7 are the EXACT inputs the Arko007 crop model needs
-    N          : float = Field(..., ge=0,   le=140, description="Nitrogen kg/ha")
-    P          : float = Field(..., ge=0,   le=145, description="Phosphorus kg/ha")
-    K          : float = Field(..., ge=0,   le=205, description="Potassium kg/ha")
-    temperature: float = Field(..., ge=0,   le=50)
-    humidity   : float = Field(..., ge=0,   le=100)
-    ph         : float = Field(..., ge=0,   le=14)
-    rainfall   : float = Field(..., ge=0,   le=500)
-    # These extras are for risk engine & revenue calc — not fed to ML model
+    N          : float = Field(..., ge=0, le=145)
+    P          : float = Field(..., ge=0, le=145)
+    K          : float = Field(..., ge=0, le=210)
+    temperature: float = Field(..., ge=0, le=50)
+    humidity   : float = Field(..., ge=0, le=100)
+    ph         : float = Field(..., ge=0, le=14)
+    rainfall   : float = Field(..., ge=0, le=3000)
     season     : str   = "Kharif"
-    land_acres : float = 1.0
-    budget     : Optional[float] = None
+    irrigation : str   = "Partial"
+    land_acres : float = Field(1.0, ge=0.1, le=1000)
+    budget     : Optional[float] = Field(None, ge=0)
+    district   : Optional[str]   = None
+    w_npk      : float = Field(0.4, ge=0.0, le=1.0)
+    top_n      : int   = Field(5, ge=1, le=10)
+
 
 class SightingRequest(BaseModel):
-    district: str; crop: str; pest: str; severity: str
+    district: str
+    crop    : str
+    pest    : str
+    severity: str
 
-# ── Endpoints ─────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════
+#  Endpoints
+# ══════════════════════════════════════════════════════════════════════
 
 @app.get("/health")
 def health():
     return {
-        "soil_model"  : soil_clf.source,
-        "crop_model"  : crop_rec.source,
-        "disease_model": disease_det.source,
+        "status"        : "ok",
+        "version"       : "5.0.0",
+        "soil_model"    : soil_clf.source,
+        "crop_model"    : crop_rec.source,
+        "disease_model" : disease_det.source,
+        "data_gov_key"  : "configured" if DATA_GOV_API_KEY else "missing",
+        "msp_cached"    : len(_msp_cache),
     }
+
 
 @app.get("/weather/{district}")
 async def get_weather(district: str):
     return await weather_svc.fetch(district)
 
+
 @app.get("/district-defaults/{district}")
 def district_defaults(district: str):
     d = DISTRICT_DATA.get(district)
-    if not d: raise HTTPException(404, f"No data for {district}")
+    if not d:
+        raise HTTPException(404, f"No data for district: {district}")
     return d
+
 
 @app.post("/analyze-soil-image")
 async def analyze_soil(file: UploadFile = File(...)):
-    if not file.content_type.startswith("image/"):
-        raise HTTPException(400, "Must be an image")
-    return soil_clf.classify(await file.read())
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(400, "Must be an image file")
+    data = await file.read()
+    if len(data) < 1000:
+        raise HTTPException(400, "Image appears empty or corrupt")
+    return soil_clf.classify(data)
+
 
 @app.post("/recommend-crops")
 async def recommend_crops(req: CropRequest):
-    # Step 1 — run the HF crop model (7 numeric inputs only)
-    top3 = crop_rec.recommend(
+    """
+    Returns top_n crops ranked by composite score.
+
+    Ranking formula (higher = better):
+      composite = AI_confidence×0.40 + (100−risk_score)×0.35 + budget_fit×0.25
+
+    budget_fit: 100 if comfortably affordable → 10 if over budget.
+    If no budget supplied, budget_fit is treated as 75 (neutral).
+
+    Each crop includes:
+      confidence, npk_score, region_score, suitability, grown_pct, avg_yield
+      risk_score, risk_level, risk_breakdown
+      affordability  (can_afford, input_cost, budget_remaining, label)
+      harvest_days
+      mandi_prices   (mandi_name, variety, min/modal/max price, arrival_date)
+      yield_estimate, revenue_estimate, input_cost_estimate
+      market_signal, explanation
+      rank, composite_score
+    """
+    # Step 1: Get 2× candidates from ML model so re-ranking has headroom
+    candidates = crop_rec.recommend(
         req.N, req.P, req.K,
-        req.temperature, req.humidity, req.ph, req.rainfall
+        req.temperature, req.humidity,
+        req.ph, req.rainfall,
+        district = req.district or "",
+        season   = req.season,
+        w_npk    = req.w_npk,
+        top_n    = min(req.top_n * 2, 10),
     )
-    # Step 2 — enrich each result with risk, yield, market data
-    results = []
-    for c in top3:
-        risk    = risk_eng.score(c["crop_name"], req.season,
-                                  req.temperature, req.humidity,
-                                  req.rainfall, req.land_acres, req.budget)
-        yield_d = YIELD_DATA.get(c["crop_name"].lower(), DEFAULT_YIELD)
-        market  = MARKET_DATA.get(c["crop_name"].lower(), DEFAULT_MARKET)
-        rev_lo  = yield_d["yield_low"]  * req.land_acres * yield_d["price"] / 100
-        rev_hi  = yield_d["yield_high"] * req.land_acres * yield_d["price"] / 100
-        results.append({
+
+    # Step 2: Enrich all candidates in parallel
+    async def _enrich(c: dict) -> dict:
+        name     = c["crop_name"]
+        crop_key = name.lower()
+
+        risk   = risk_eng.score(name, req.season, req.temperature,
+                                req.humidity, req.rainfall, req.land_acres, req.budget)
+        afford = risk_eng.affordability(name, req.land_acres, req.budget)
+
+        yield_d = _yield_estimate(name, req.land_acres, req.irrigation)
+        market  = _market_info(name)
+
+        # Revenue: use live Agmarknet modal price if available
+        live_price = await _fetch_agmarknet_modal(crop_key)
+        price      = live_price or _msp_cache.get(crop_key) or MARKET_PRICES_FALLBACK.get(crop_key, 3000)
+        revenue    = _revenue_from_price(name, req.land_acres, req.irrigation, price)
+
+        # Variety-wise mandi prices (nearest APMC)
+        mandi = await _fetch_mandi_prices(crop_key, req.district or "Pune")
+        if mandi is None:
+            fp = MARKET_PRICES_FALLBACK.get(crop_key)
+            if fp:
+                mandi = {
+                    "mandi_name"  : f"{req.district or 'Maharashtra'} APMC",
+                    "commodity"   : name,
+                    "variety"     : "Common",
+                    "min_price"   : round(fp * 0.75),
+                    "modal_price" : fp,
+                    "max_price"   : round(fp * 1.25),
+                    "arrival_date": "2023-24 average",
+                    "all_mandis"  : [],
+                    "source"      : "static_fallback",
+                }
+
+        harvest_days = HARVEST_DAYS.get(crop_key, 120)
+
+        return {
             **c,
-            "risk_score"    : risk["total"],
-            "risk_level"    : risk["level"],
-            "risk_breakdown": risk["breakdown"],
-            "explanation"   : _explain(c["crop_name"], req),
-            "market"        : market,
-            "yield_estimate": f"{yield_d['yield_low']}–{yield_d['yield_high']} kg/acre",
-            "revenue_estimate": f"₹{int(rev_lo):,}–₹{int(rev_hi):,}",
-        })
+            "risk_score"          : risk["total"],
+            "risk_level"          : risk["level"],
+            "risk_breakdown"      : risk["breakdown"],
+            "affordability"       : afford,
+            "harvest_days"        : harvest_days,
+            "mandi_prices"        : mandi,
+            "explanation"         : _explain(name, req),
+            "market_signal"       : market,
+            "yield_estimate"      : yield_d,
+            "revenue_estimate"    : revenue,
+            "input_cost_estimate" : _input_cost_str(name, req.land_acres),
+        }
+
+    enriched = list(await asyncio.gather(*[_enrich(c) for c in candidates]))
+
+    # Step 3: Re-rank by composite score
+    def _composite(crop: dict) -> float:
+        ai_conf    = float(crop["confidence"])
+        risk_inv   = 100.0 - float(crop["risk_score"])
+        af         = crop["affordability"]
+        if af["budget_ratio"] is None:
+            budget_fit = 75.0          # no budget → neutral
+        else:
+            r = af["budget_ratio"]
+            if r < 0.50:   budget_fit = 100.0
+            elif r < 0.85: budget_fit = 85.0
+            elif r < 1.00: budget_fit = 70.0
+            elif r < 1.20: budget_fit = 35.0
+            else:          budget_fit = 10.0
+        return ai_conf * 0.40 + risk_inv * 0.35 + budget_fit * 0.25
+
+    ranked = sorted(enriched, key=_composite, reverse=True)[: req.top_n]
+    for i, crop in enumerate(ranked):
+        crop["rank"]            = i + 1
+        crop["composite_score"] = round(_composite(crop), 1)
+
     weather = await weather_svc.fetch_or_use(req.temperature, req.humidity, req.rainfall)
-    return {"top_3": results, "weather": weather}
+    return {"crops": ranked, "total": len(ranked), "weather": weather}
+
+
+@app.get("/mandi-prices/{district}/{crop}")
+async def mandi_prices(district: str, crop: str):
+    """Live variety-wise Agmarknet prices for a crop at the nearest Maharashtra mandi."""
+    live = await _fetch_mandi_prices(crop.lower(), district)
+    if live:
+        return live
+    fp = MARKET_PRICES_FALLBACK.get(crop.lower())
+    if not fp:
+        raise HTTPException(404, f"No price data for {crop}")
+    return {
+        "mandi_name"  : f"{district} APMC",
+        "commodity"   : crop.title(),
+        "variety"     : "Common",
+        "min_price"   : round(fp * 0.75),
+        "modal_price" : fp,
+        "max_price"   : round(fp * 1.25),
+        "arrival_date": "2023-24 average",
+        "all_mandis"  : [],
+        "source"      : "static_fallback",
+    }
+
 
 @app.post("/diagnose-crop-image")
 async def diagnose(
@@ -133,91 +617,396 @@ async def diagnose(
 ):
     return await disease_det.diagnose(await file.read(), crop_name)
 
+
 @app.get("/pest-alerts/{district}/{crop}")
-async def pest_alerts(district: str, crop: str):
+async def pest_alerts(district: str, crop: str, season: str = "Kharif"):
     weather  = await weather_svc.fetch(district)
-    w_alerts = pest_eng.weather_alerts(crop, weather)
-    conn     = sqlite3.connect("sightings.db")
-    rows     = conn.execute(
-        "SELECT pest,severity,COUNT(*) FROM sightings "
-        "WHERE district=? AND crop=? AND ts>datetime('now','-7 days') "
-        "GROUP BY pest,severity", (district, crop)
-    ).fetchall(); conn.close()
-    c_alerts = [{"pest_name":r[0],"severity":r[1],"report_count":r[2],
-                 "alert_type":"community","crop":crop,
-                 "trigger_reason":f"{r[2]} farmer(s) reported in 7 days",
-                 "action": pest_eng.action(r[0]),
-                 "organic": pest_eng.organic(r[0])} for r in rows]
-    return {"alerts": w_alerts + c_alerts}
+    w_alerts = pest_eng.weather_alerts(crop, weather, season)
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        """SELECT pest, severity, COUNT(*) as cnt FROM sightings
+           WHERE LOWER(district)=LOWER(?) AND LOWER(crop)=LOWER(?)
+             AND ts > datetime('now','-7 days')
+           GROUP BY pest, severity ORDER BY cnt DESC""",
+        (district, crop),
+    ).fetchall()
+    conn.close()
+    c_alerts = [{
+        "pest_name"      : pest,
+        "crop"           : crop,
+        "severity"       : sev,
+        "alert_type"     : "community",
+        "report_count"   : cnt,
+        "trigger_reason" : f"{cnt} farmer(s) in {district} reported {pest} in last 7 days",
+        "action"         : pest_eng.action(pest),
+        "organic"        : pest_eng.organic(pest),
+        "days_until_peak": 3,
+        "time_posted"    : "Recent",
+    } for (pest, sev, cnt) in rows]
+    return {"alerts": w_alerts + c_alerts, "district": district, "crop": crop}
+
 
 @app.post("/report-sighting")
 def report_sighting(req: SightingRequest):
-    conn = sqlite3.connect("sightings.db")
-    conn.execute("INSERT INTO sightings(district,crop,pest,severity) VALUES(?,?,?,?)",
-                 (req.district, req.crop, req.pest, req.severity))
+    if not req.pest.strip():
+        raise HTTPException(400, "Pest name required")
+    if req.severity.upper() not in ("LOW", "MEDIUM", "HIGH"):
+        raise HTTPException(400, "Severity must be LOW, MEDIUM, or HIGH")
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO sightings (district, crop, pest, severity) VALUES (?,?,?,?)",
+        (req.district.strip(), req.crop.strip(), req.pest.strip(), req.severity.upper()),
+    )
     conn.commit()
-    n = conn.execute("SELECT COUNT(*) FROM sightings WHERE district=? AND crop=?",
-                     (req.district, req.crop)).fetchone()[0]
+    n = conn.execute(
+        "SELECT COUNT(*) FROM sightings WHERE LOWER(district)=LOWER(?) AND LOWER(crop)=LOWER(?)",
+        (req.district, req.crop),
+    ).fetchone()[0]
     conn.close()
-    return {"success": True, "farmers_alerted": n}
+    return {"success": True, "message": "Sighting recorded", "farmers_alerted": n}
 
-# ── Helper: plain-language explanation ───────────────────────────────
+
+@app.get("/crop-recommender-meta")
+def crop_recommender_meta():
+    return {"districts": crop_rec.districts, "seasons": crop_rec.seasons, "source": crop_rec.source}
+
+
+@app.get("/market-prices/{crop}")
+async def get_market_price(crop: str):
+    live = await _fetch_agmarknet_modal(crop.lower())
+    if live:
+        return {"crop": crop, "price": live, "source": "agmarknet_live", "unit": "₹/quintal"}
+    fb = MARKET_PRICES_FALLBACK.get(crop.lower())
+    return {"crop": crop, "price": fb, "source": "static_fallback", "unit": "₹/quintal"}
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Helper functions
+# ══════════════════════════════════════════════════════════════════════
+
+def _yield_estimate(crop: str, land: float, irrigation: str) -> str:
+    d = YIELD_BENCHMARKS.get(crop.lower())
+    if not d:
+        return "Data not available"
+    f  = IRRIGATION_YIELD_FACTOR.get(irrigation, 1.0)
+    lo = int(d["low"]  * land * f)
+    hi = int(d["high"] * land * f)
+    if d["high"] > 5000:
+        return f"{lo/1000:.1f}–{hi/1000:.1f} tonnes"
+    return f"{lo}–{hi} kg  ({lo//100}–{hi//100} qtl)"
+
+
+def _revenue_from_price(crop: str, land: float, irrigation: str, price: float) -> str:
+    d = YIELD_BENCHMARKS.get(crop.lower())
+    if not d:
+        return "N/A"
+    f     = IRRIGATION_YIELD_FACTOR.get(irrigation, 1.0)
+    lo_kg = d["low"]  * land * f
+    hi_kg = d["high"] * land * f
+    return f"₹{int(lo_kg/100*price):,}–₹{int(hi_kg/100*price):,}"
+
+
+def _input_cost_str(crop: str, land: float) -> str:
+    d = INPUT_COSTS.get(crop.lower(), DEFAULT_INPUT_COST)
+    return f"₹{int(d['total'] * land):,}"
+
+
+def _market_info(crop: str) -> dict:
+    crop_key = crop.lower()
+    mkt      = MARKET_DATA.get(crop_key)
+    msp      = _msp_cache.get(crop_key) or MSP_FALLBACK.get(crop_key)
+    if mkt:
+        trend, demand, oversupply, _ = mkt
+    else:
+        trend, demand, oversupply = "STABLE", "MEDIUM", False
+    return {
+        "price_trend"    : trend,
+        "demand_level"   : demand,
+        "oversupply_risk": oversupply,
+        "msp_price"      : msp or MARKET_PRICES_FALLBACK.get(crop_key),
+    }
+
+
 def _explain(crop: str, req: CropRequest) -> list[str]:
-    pts = [f"Soil NPK profile suits {crop} cultivation"]
-    if req.rainfall > 150: pts.append(f"Rainfall ({int(req.rainfall)}mm) meets {crop}'s water needs")
-    else: pts.append(f"Low rainfall — consider irrigation for {crop}")
-    if 6.0 <= req.ph <= 7.5: pts.append(f"Soil pH ({req.ph}) is in ideal range for {crop}")
-    pts.append(f"{req.season} season aligns with {crop}'s growing cycle")
-    return pts[:3]
+    pts  = []
+    prof = CROP_PROFILES.get(crop.lower(), {})
+    tlo, thi = prof.get("temp", (20, 33))
+    rlo, rhi = prof.get("rain", (400, 1200))
 
-# ═══════════════════════════════════════════════════════════════════════
-# Static data embedded in main.py (move to JSON files if preferred)
-# ═══════════════════════════════════════════════════════════════════════
+    if req.N >= 70:
+        pts.append(f"Good nitrogen levels ({req.N:.0f} mg/kg) support strong {crop} growth")
+    else:
+        pts.append(f"Moderate nitrogen — consider urea top-dressing for {crop}")
 
-DISTRICT_DATA = {
-    "Nagpur"  :{"typical_soil_type":"Black","npk_range":{"N_low":60,"N_high":80,"P_low":50,"P_high":80,"K_low":80,"K_high":120},"avg_ph_range":{"low":7.0,"high":8.5},"avg_annual_rainfall_mm":1034,"primary_season":"Kharif","common_crops":["Cotton","Soybean","Orange","Wheat"],"weather_city":"Nagpur"},
-    "Pune"    :{"typical_soil_type":"Black","npk_range":{"N_low":55,"N_high":75,"P_low":40,"P_high":70,"K_low":70,"K_high":110},"avg_ph_range":{"low":6.5,"high":8.0},"avg_annual_rainfall_mm":720,"primary_season":"Kharif","common_crops":["Sugarcane","Grapes","Onion","Wheat"],"weather_city":"Pune"},
-    "Nashik"  :{"typical_soil_type":"Red","npk_range":{"N_low":30,"N_high":50,"P_low":20,"P_high":40,"K_low":50,"K_high":80},"avg_ph_range":{"low":6.0,"high":7.5},"avg_annual_rainfall_mm":680,"primary_season":"Kharif","common_crops":["Grapes","Onion","Tomato"],"weather_city":"Nashik"},
-    "Ludhiana":{"typical_soil_type":"Alluvial","npk_range":{"N_low":90,"N_high":120,"P_low":45,"P_high":70,"K_low":100,"K_high":140},"avg_ph_range":{"low":7.0,"high":8.0},"avg_annual_rainfall_mm":680,"primary_season":"Rabi","common_crops":["Wheat","Rice","Maize","Cotton"],"weather_city":"Ludhiana"},
-    "Amritsar":{"typical_soil_type":"Alluvial","npk_range":{"N_low":85,"N_high":115,"P_low":40,"P_high":65,"K_low":95,"K_high":135},"avg_ph_range":{"low":7.0,"high":8.0},"avg_annual_rainfall_mm":680,"primary_season":"Rabi","common_crops":["Wheat","Rice","Sugarcane"],"weather_city":"Amritsar"},
-    "Patna"   :{"typical_soil_type":"Alluvial","npk_range":{"N_low":70,"N_high":100,"P_low":35,"P_high":60,"K_low":80,"K_high":120},"avg_ph_range":{"low":6.5,"high":7.5},"avg_annual_rainfall_mm":1050,"primary_season":"Kharif","common_crops":["Rice","Wheat","Maize","Lentil"],"weather_city":"Patna"},
-    "Varanasi":{"typical_soil_type":"Alluvial","npk_range":{"N_low":75,"N_high":105,"P_low":38,"P_high":62,"K_low":85,"K_high":125},"avg_ph_range":{"low":7.0,"high":8.0},"avg_annual_rainfall_mm":1000,"primary_season":"Kharif","common_crops":["Rice","Wheat","Sugarcane"],"weather_city":"Varanasi"},
-    "Hyderabad":{"typical_soil_type":"Red","npk_range":{"N_low":25,"N_high":45,"P_low":15,"P_high":35,"K_low":45,"K_high":75},"avg_ph_range":{"low":5.5,"high":7.0},"avg_annual_rainfall_mm":780,"primary_season":"Kharif","common_crops":["Rice","Cotton","Maize","Groundnut"],"weather_city":"Hyderabad"},
-    "Coimbatore":{"typical_soil_type":"Red","npk_range":{"N_low":20,"N_high":40,"P_low":12,"P_high":28,"K_low":40,"K_high":70},"avg_ph_range":{"low":5.5,"high":7.0},"avg_annual_rainfall_mm":700,"primary_season":"Kharif","common_crops":["Cotton","Groundnut","Maize","Coconut"],"weather_city":"Coimbatore"},
-    "Jaipur"  :{"typical_soil_type":"Red","npk_range":{"N_low":15,"N_high":35,"P_low":10,"P_high":25,"K_low":30,"K_high":60},"avg_ph_range":{"low":7.0,"high":8.5},"avg_annual_rainfall_mm":530,"primary_season":"Kharif","common_crops":["Millet","Groundnut","Mustard","Wheat"],"weather_city":"Jaipur"},
-    "Bhopal"  :{"typical_soil_type":"Black","npk_range":{"N_low":55,"N_high":75,"P_low":45,"P_high":70,"K_low":75,"K_high":115},"avg_ph_range":{"low":6.5,"high":8.0},"avg_annual_rainfall_mm":1150,"primary_season":"Kharif","common_crops":["Soybean","Wheat","Cotton","Maize"],"weather_city":"Bhopal"},
-    "Ahmedabad":{"typical_soil_type":"Black","npk_range":{"N_low":50,"N_high":70,"P_low":40,"P_high":65,"K_low":70,"K_high":110},"avg_ph_range":{"low":7.0,"high":8.5},"avg_annual_rainfall_mm":780,"primary_season":"Kharif","common_crops":["Cotton","Groundnut","Wheat","Castor"],"weather_city":"Ahmedabad"},
+    if tlo <= req.temperature <= thi:
+        pts.append(f"Current temperature ({req.temperature:.0f}°C) is ideal for {crop}")
+    else:
+        pts.append(f"Temperature ({req.temperature:.0f}°C) is outside ideal range; monitor closely")
+
+    if rlo <= req.rainfall <= rhi:
+        pts.append(f"Rainfall ({req.rainfall:.0f} mm) meets {crop}'s water requirements")
+    elif req.rainfall < rlo:
+        pts.append(f"Low rainfall ({req.rainfall:.0f} mm) — irrigation essential for {crop}")
+    else:
+        pts.append(f"High rainfall ({req.rainfall:.0f} mm) — ensure good drainage for {crop}")
+
+    seasons = prof.get("seasons", [])
+    if req.season in seasons or not seasons:
+        pts.append(f"{req.season} season aligns with {crop}'s optimal growing cycle")
+    else:
+        pts.append(f"{crop} can be grown in {req.season} but performs best in {'/'.join(seasons)}")
+
+    return pts[:4]
+
+DISTRICT_DATA: dict[str, dict] = {
+    # ── Vidarbha ─────────────────────────────────────────────────────
+    "Nagpur": dict(
+        region="Vidarbha", typical_soil_type="Black Soil",
+        npk_range=dict(N_low=60,N_high=85,P_low=50,P_high=80,K_low=80,K_high=130),
+        avg_ph_range=dict(low=7.0,high=8.5), avg_annual_rainfall_mm=1034,
+        primary_season="Kharif", weather_city="Nagpur",
+        common_crops=["Cotton","Soybean","Orange","Wheat","Pigeonpeas"],
+    ),
+    "Wardha": dict(
+        region="Vidarbha", typical_soil_type="Black Soil",
+        npk_range=dict(N_low=55,N_high=80,P_low=45,P_high=75,K_low=75,K_high=120),
+        avg_ph_range=dict(low=7.0,high=8.5), avg_annual_rainfall_mm=920,
+        primary_season="Kharif", weather_city="Wardha",
+        common_crops=["Cotton","Soybean","Wheat","Pigeonpeas"],
+    ),
+    "Amravati": dict(
+        region="Vidarbha", typical_soil_type="Black Soil",
+        npk_range=dict(N_low=55,N_high=80,P_low=45,P_high=75,K_low=75,K_high=120),
+        avg_ph_range=dict(low=7.0,high=8.5), avg_annual_rainfall_mm=870,
+        primary_season="Kharif", weather_city="Amravati",
+        common_crops=["Cotton","Soybean","Orange","Pigeonpeas"],
+    ),
+    "Akola": dict(
+        region="Vidarbha", typical_soil_type="Black Soil",
+        npk_range=dict(N_low=55,N_high=78,P_low=48,P_high=75,K_low=78,K_high=118),
+        avg_ph_range=dict(low=7.2,high=8.6), avg_annual_rainfall_mm=790,
+        primary_season="Kharif", weather_city="Akola",
+        common_crops=["Cotton","Soybean","Wheat","Pigeonpeas"],
+    ),
+    "Washim": dict(
+        region="Vidarbha", typical_soil_type="Black Soil",
+        npk_range=dict(N_low=52,N_high=75,P_low=44,P_high=70,K_low=72,K_high=115),
+        avg_ph_range=dict(low=7.2,high=8.5), avg_annual_rainfall_mm=760,
+        primary_season="Kharif", weather_city="Washim",
+        common_crops=["Cotton","Soybean","Pigeonpeas","Mungbean"],
+    ),
+    "Buldhana": dict(
+        region="Vidarbha", typical_soil_type="Black Soil",
+        npk_range=dict(N_low=52,N_high=78,P_low=46,P_high=72,K_low=74,K_high=116),
+        avg_ph_range=dict(low=7.0,high=8.5), avg_annual_rainfall_mm=800,
+        primary_season="Kharif", weather_city="Buldhana",
+        common_crops=["Cotton","Soybean","Wheat","Orange"],
+    ),
+    "Yavatmal": dict(
+        region="Vidarbha", typical_soil_type="Black Soil",
+        npk_range=dict(N_low=58,N_high=82,P_low=48,P_high=76,K_low=76,K_high=122),
+        avg_ph_range=dict(low=7.0,high=8.4), avg_annual_rainfall_mm=920,
+        primary_season="Kharif", weather_city="Yavatmal",
+        common_crops=["Cotton","Soybean","Pigeonpeas","Wheat"],
+    ),
+    "Chandrapur": dict(
+        region="Vidarbha", typical_soil_type="Red Soil",
+        npk_range=dict(N_low=40,N_high=65,P_low=25,P_high=50,K_low=55,K_high=90),
+        avg_ph_range=dict(low=6.0,high=7.5), avg_annual_rainfall_mm=1250,
+        primary_season="Kharif", weather_city="Chandrapur",
+        common_crops=["Rice","Cotton","Soybean","Maize"],
+    ),
+    "Gadchiroli": dict(
+        region="Vidarbha", typical_soil_type="Red Soil",
+        npk_range=dict(N_low=35,N_high=60,P_low=20,P_high=45,K_low=50,K_high=85),
+        avg_ph_range=dict(low=5.5,high=7.0), avg_annual_rainfall_mm=1500,
+        primary_season="Kharif", weather_city="Gadchiroli",
+        common_crops=["Rice","Maize","Sorghum"],
+    ),
+    "Gondia": dict(
+        region="Vidarbha", typical_soil_type="Alluvial Soil",
+        npk_range=dict(N_low=65,N_high=95,P_low=38,P_high=65,K_low=80,K_high=125),
+        avg_ph_range=dict(low=6.5,high=7.8), avg_annual_rainfall_mm=1350,
+        primary_season="Kharif", weather_city="Gondia",
+        common_crops=["Rice","Wheat","Soybean"],
+    ),
+    "Bhandara": dict(
+        region="Vidarbha", typical_soil_type="Alluvial Soil",
+        npk_range=dict(N_low=68,N_high=98,P_low=40,P_high=68,K_low=82,K_high=128),
+        avg_ph_range=dict(low=6.5,high=7.8), avg_annual_rainfall_mm=1320,
+        primary_season="Kharif", weather_city="Bhandara",
+        common_crops=["Rice","Wheat","Maize","Soybean"],
+    ),
+    # ── Marathwada ───────────────────────────────────────────────────
+    "Chhatrapati Sambhajinagar": dict(
+        region="Marathwada", typical_soil_type="Black Soil",
+        npk_range=dict(N_low=50,N_high=75,P_low=40,P_high=68,K_low=70,K_high=110),
+        avg_ph_range=dict(low=7.2,high=8.6), avg_annual_rainfall_mm=710,
+        primary_season="Kharif", weather_city="Aurangabad",
+        common_crops=["Cotton","Soybean","Sugarcane","Pigeonpeas","Wheat"],
+    ),
+    "Dharashiv": dict(
+        region="Marathwada", typical_soil_type="Black Soil",
+        npk_range=dict(N_low=48,N_high=72,P_low=38,P_high=65,K_low=68,K_high=108),
+        avg_ph_range=dict(low=7.2,high=8.6), avg_annual_rainfall_mm=670,
+        primary_season="Kharif", weather_city="Osmanabad",
+        common_crops=["Soybean","Pigeonpeas","Cotton","Sugarcane"],
+    ),
+    "Beed": dict(
+        region="Marathwada", typical_soil_type="Black Soil",
+        npk_range=dict(N_low=48,N_high=73,P_low=40,P_high=66,K_low=68,K_high=108),
+        avg_ph_range=dict(low=7.2,high=8.6), avg_annual_rainfall_mm=680,
+        primary_season="Kharif", weather_city="Beed",
+        common_crops=["Sugarcane","Cotton","Soybean","Pomegranate"],
+    ),
+    "Hingoli": dict(
+        region="Marathwada", typical_soil_type="Black Soil",
+        npk_range=dict(N_low=50,N_high=74,P_low=42,P_high=68,K_low=70,K_high=112),
+        avg_ph_range=dict(low=7.0,high=8.4), avg_annual_rainfall_mm=830,
+        primary_season="Kharif", weather_city="Hingoli",
+        common_crops=["Soybean","Cotton","Pigeonpeas","Wheat"],
+    ),
+    "Jalna": dict(
+        region="Marathwada", typical_soil_type="Black Soil",
+        npk_range=dict(N_low=50,N_high=74,P_low=42,P_high=68,K_low=70,K_high=110),
+        avg_ph_range=dict(low=7.2,high=8.5), avg_annual_rainfall_mm=720,
+        primary_season="Kharif", weather_city="Jalna",
+        common_crops=["Cotton","Soybean","Mungbean","Wheat"],
+    ),
+    "Latur": dict(
+        region="Marathwada", typical_soil_type="Black Soil",
+        npk_range=dict(N_low=48,N_high=72,P_low=40,P_high=66,K_low=66,K_high=106),
+        avg_ph_range=dict(low=7.2,high=8.6), avg_annual_rainfall_mm=680,
+        primary_season="Kharif", weather_city="Latur",
+        common_crops=["Soybean","Pigeonpeas","Sugarcane","Cotton"],
+    ),
+    "Nanded": dict(
+        region="Marathwada", typical_soil_type="Black Soil",
+        npk_range=dict(N_low=52,N_high=76,P_low=44,P_high=70,K_low=72,K_high=112),
+        avg_ph_range=dict(low=7.0,high=8.5), avg_annual_rainfall_mm=860,
+        primary_season="Kharif", weather_city="Nanded",
+        common_crops=["Soybean","Cotton","Sugarcane","Banana"],
+    ),
+    "Parbhani": dict(
+        region="Marathwada", typical_soil_type="Black Soil",
+        npk_range=dict(N_low=50,N_high=74,P_low=42,P_high=68,K_low=70,K_high=110),
+        avg_ph_range=dict(low=7.2,high=8.6), avg_annual_rainfall_mm=760,
+        primary_season="Kharif", weather_city="Parbhani",
+        common_crops=["Soybean","Cotton","Pigeonpeas","Wheat"],
+    ),
+    # ── Western Maharashtra ──────────────────────────────────────────
+    "Pune": dict(
+        region="Western Maharashtra", typical_soil_type="Black Soil",
+        npk_range=dict(N_low=55,N_high=80,P_low=40,P_high=70,K_low=70,K_high=115),
+        avg_ph_range=dict(low=6.5,high=8.0), avg_annual_rainfall_mm=725,
+        primary_season="Kharif", weather_city="Pune",
+        common_crops=["Sugarcane","Grapes","Onion","Wheat","Tomato"],
+    ),
+    "Nashik": dict(
+        region="Northern Maharashtra", typical_soil_type="Red Soil",
+        npk_range=dict(N_low=30,N_high=55,P_low=18,P_high=40,K_low=48,K_high=82),
+        avg_ph_range=dict(low=5.8,high=7.2), avg_annual_rainfall_mm=680,
+        primary_season="Kharif", weather_city="Nashik",
+        common_crops=["Grapes","Onion","Tomato","Wheat","Maize"],
+    ),
+    "Ahilyanagar": dict(
+        region="Western Maharashtra", typical_soil_type="Black Soil",
+        npk_range=dict(N_low=52,N_high=78,P_low=42,P_high=68,K_low=72,K_high=112),
+        avg_ph_range=dict(low=6.8,high=8.2), avg_annual_rainfall_mm=590,
+        primary_season="Kharif", weather_city="Ahmednagar",
+        common_crops=["Sugarcane","Onion","Cotton","Pomegranate"],
+    ),
+    "Solapur": dict(
+        region="Western Maharashtra", typical_soil_type="Black Soil",
+        npk_range=dict(N_low=45,N_high=70,P_low=38,P_high=62,K_low=65,K_high=105),
+        avg_ph_range=dict(low=7.0,high=8.5), avg_annual_rainfall_mm=540,
+        primary_season="Kharif", weather_city="Solapur",
+        common_crops=["Pomegranate","Sugarcane","Onion","Sorghum"],
+    ),
+    "Satara": dict(
+        region="Western Maharashtra", typical_soil_type="Loamy Soil",
+        npk_range=dict(N_low=60,N_high=88,P_low=42,P_high=70,K_low=75,K_high=118),
+        avg_ph_range=dict(low=6.2,high=7.8), avg_annual_rainfall_mm=780,
+        primary_season="Kharif", weather_city="Satara",
+        common_crops=["Sugarcane","Onion","Wheat","Maize","Tomato"],
+    ),
+    "Sangli": dict(
+        region="Western Maharashtra", typical_soil_type="Black Soil",
+        npk_range=dict(N_low=55,N_high=82,P_low=42,P_high=70,K_low=72,K_high=115),
+        avg_ph_range=dict(low=7.0,high=8.2), avg_annual_rainfall_mm=520,
+        primary_season="Kharif", weather_city="Sangli",
+        common_crops=["Sugarcane","Grapes","Turmeric","Onion","Sorghum"],
+    ),
+    "Kolhapur": dict(
+        region="Western Maharashtra", typical_soil_type="Loamy Soil",
+        npk_range=dict(N_low=65,N_high=95,P_low=45,P_high=75,K_low=80,K_high=128),
+        avg_ph_range=dict(low=5.8,high=7.5), avg_annual_rainfall_mm=1100,
+        primary_season="Kharif", weather_city="Kolhapur",
+        common_crops=["Sugarcane","Rice","Groundnut","Soybean"],
+    ),
+    # ── Konkan ───────────────────────────────────────────────────────
+    "Raigad": dict(
+        region="Konkan", typical_soil_type="Laterite Soil",
+        npk_range=dict(N_low=22,N_high=45,P_low=12,P_high=28,K_low=35,K_high=65),
+        avg_ph_range=dict(low=5.0,high=6.5), avg_annual_rainfall_mm=2500,
+        primary_season="Kharif", weather_city="Alibaug",
+        common_crops=["Rice","Coconut","Mango","Cashew","Banana"],
+    ),
+    "Ratnagiri": dict(
+        region="Konkan", typical_soil_type="Laterite Soil",
+        npk_range=dict(N_low=20,N_high=42,P_low=10,P_high=25,K_low=32,K_high=60),
+        avg_ph_range=dict(low=5.0,high=6.5), avg_annual_rainfall_mm=3000,
+        primary_season="Kharif", weather_city="Ratnagiri",
+        common_crops=["Alphonso Mango","Cashew","Coconut","Rice"],
+    ),
+    "Sindhudurg": dict(
+        region="Konkan", typical_soil_type="Laterite Soil",
+        npk_range=dict(N_low=20,N_high=42,P_low=10,P_high=26,K_low=33,K_high=62),
+        avg_ph_range=dict(low=5.0,high=6.5), avg_annual_rainfall_mm=3200,
+        primary_season="Kharif", weather_city="Sindhudurg",
+        common_crops=["Coconut","Cashew","Rice","Mango"],
+    ),
+    "Thane": dict(
+        region="Konkan", typical_soil_type="Laterite Soil",
+        npk_range=dict(N_low=25,N_high=48,P_low=12,P_high=30,K_low=38,K_high=68),
+        avg_ph_range=dict(low=5.2,high=6.8), avg_annual_rainfall_mm=2600,
+        primary_season="Kharif", weather_city="Thane",
+        common_crops=["Rice","Maize","Vegetables","Coconut"],
+    ),
+    "Palghar": dict(
+        region="Konkan", typical_soil_type="Laterite Soil",
+        npk_range=dict(N_low=22,N_high=46,P_low=11,P_high=28,K_low=36,K_high=66),
+        avg_ph_range=dict(low=5.2,high=6.8), avg_annual_rainfall_mm=2800,
+        primary_season="Kharif", weather_city="Palghar",
+        common_crops=["Rice","Vegetables","Banana","Coconut"],
+    ),
+    "Mumbai suburban": dict(
+        region="Konkan", typical_soil_type="Laterite Soil",
+        npk_range=dict(N_low=20,N_high=40,P_low=10,P_high=25,K_low=30,K_high=58),
+        avg_ph_range=dict(low=5.0,high=6.5), avg_annual_rainfall_mm=2400,
+        primary_season="Kharif", weather_city="Mumbai",
+        common_crops=["Vegetables","Rice"],
+    ),
+    # ── Northern Maharashtra ─────────────────────────────────────────
+    "Dhule": dict(
+        region="Northern Maharashtra", typical_soil_type="Red Soil",
+        npk_range=dict(N_low=25,N_high=50,P_low=15,P_high=35,K_low=42,K_high=75),
+        avg_ph_range=dict(low=6.5,high=8.0), avg_annual_rainfall_mm=575,
+        primary_season="Kharif", weather_city="Dhule",
+        common_crops=["Maize","Cotton","Onion","Wheat","Groundnut"],
+    ),
+    "Nandurbar": dict(
+        region="Northern Maharashtra", typical_soil_type="Red Soil",
+        npk_range=dict(N_low=25,N_high=48,P_low=14,P_high=32,K_low=40,K_high=72),
+        avg_ph_range=dict(low=6.0,high=7.8), avg_annual_rainfall_mm=900,
+        primary_season="Kharif", weather_city="Nandurbar",
+        common_crops=["Maize","Cotton","Sorghum","Banana"],
+    ),
+    "Jalgaon": dict(
+        region="Northern Maharashtra", typical_soil_type="Black Soil",
+        npk_range=dict(N_low=55,N_high=80,P_low=44,P_high=72,K_low=74,K_high=118),
+        avg_ph_range=dict(low=7.0,high=8.4), avg_annual_rainfall_mm=680,
+        primary_season="Kharif", weather_city="Jalgaon",
+        common_crops=["Banana","Cotton","Maize","Wheat","Onion"],
+    ),
 }
-
-YIELD_DATA = {
-    "rice"    :{"yield_low":1400,"yield_high":2200,"price":2100,"input_cost":18000},
-    "wheat"   :{"yield_low":1200,"yield_high":2000,"price":2200,"input_cost":15000},
-    "cotton"  :{"yield_low":280, "yield_high":520, "price":6600,"input_cost":22000},
-    "soybean" :{"yield_low":700, "yield_high":1100,"price":4000,"input_cost":12000},
-    "maize"   :{"yield_low":1000,"yield_high":1800,"price":1800,"input_cost":13000},
-    "groundnut":{"yield_low":600,"yield_high":1000,"price":5000,"input_cost":14000},
-    "banana"  :{"yield_low":8000,"yield_high":14000,"price":1500,"input_cost":25000},
-    "mango"   :{"yield_low":3000,"yield_high":6000,"price":3000,"input_cost":20000},
-    "coconut" :{"yield_low":5000,"yield_high":9000,"price":1200,"input_cost":18000},
-    "coffee"  :{"yield_low":400, "yield_high":700, "price":8000,"input_cost":30000},
-    "jute"    :{"yield_low":1800,"yield_high":2800,"price":3500,"input_cost":14000},
-    "lentil"  :{"yield_low":400, "yield_high":700, "price":5500,"input_cost":10000},
-}
-DEFAULT_YIELD = {"yield_low":600,"yield_high":1000,"price":3000,"input_cost":15000}
-
-MARKET_DATA = {
-    "rice"    :{"price_trend":"STABLE","demand_level":"HIGH",  "oversupply_risk":False},
-    "wheat"   :{"price_trend":"STABLE","demand_level":"HIGH",  "oversupply_risk":False},
-    "cotton"  :{"price_trend":"DOWN",  "demand_level":"MEDIUM","oversupply_risk":True},
-    "soybean" :{"price_trend":"UP",    "demand_level":"HIGH",  "oversupply_risk":False},
-    "maize"   :{"price_trend":"UP",    "demand_level":"HIGH",  "oversupply_risk":False},
-    "mango"   :{"price_trend":"UP",    "demand_level":"HIGH",  "oversupply_risk":False},
-    "banana"  :{"price_trend":"STABLE","demand_level":"HIGH",  "oversupply_risk":False},
-    "coffee"  :{"price_trend":"UP",    "demand_level":"MEDIUM","oversupply_risk":False},
-    "coconut" :{"price_trend":"STABLE","demand_level":"MEDIUM","oversupply_risk":False},
-    "jute"    :{"price_trend":"STABLE","demand_level":"MEDIUM","oversupply_risk":False},
-}
-DEFAULT_MARKET = {"price_trend":"STABLE","demand_level":"MEDIUM","oversupply_risk":False}
-
-
-
